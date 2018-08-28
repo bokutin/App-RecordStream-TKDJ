@@ -1,18 +1,18 @@
-requires 'perl', '5.010001';
+requires "Algorithm::Combinatorics" => "0";
+requires "Algorithm::Line::Bresenham" => "0";
+requires "App::Cmd" => "0";
+requires "Color::Similarity" => "0";
+requires "Convert::Color" => "0";
+requires "IO::All" => "0";
+requires "Image::Magick" => "0";
+requires "JSON::MaybeXS" => "0";
+requires "Lingua::JA::Regular::Unicode" => "0";
+requires "List::UtilsBy" => "0";
+requires "Modern::Perl" => "0";
+requires "Text::Trim" => "0";
+requires "XML::Twig" => "0";
+requires "rlib" => "0";
 
-requires 'Algorithm::Combinatorics';
-requires 'Cache::File';
-requires 'IO::All';
-requires 'IPC::Run';
-requires 'List::Util';
-requires 'List::UtilsBy';
-requires 'Math::Round';
-requires 'Set::IntSpan';
-requires 'Text::Trim';
-requires 'URI::Fetch';
-requires 'XML::Twig';
-
-on 'test' => sub {
-    requires 'Test::More', '0.98';
-    requires 'Test::Differences', '0.98';
+on 'configure' => sub {
+  requires "ExtUtils::MakeMaker" => "7.1101";
 };

@@ -1,0 +1,553 @@
+#!/usr/bin/env perl
+
+use rlib;
+use utf8;
+use Modern::Perl;
+use base qw(App::Cmd::Simple);
+
+use Convert::Color::RGB;
+use Convert::Color::RGB8;
+use File::Path qw(make_path);
+use File::Temp;
+use FindBin;
+use IO::All;
+use Lingua::JA::Regular::Unicode qw(alnum_z2h);
+use List::MoreUtils qw(firstidx);
+use List::Util qw(sum);
+use List::UtilsBy qw(max_by min_by nsort_by);
+use POSIX qw(strftime);
+use Text::Trim;
+
+# デバッグ用のカラーパレット http://flatuicolors.com/
+my @COLORS = "
+    .color.belize-hole{background:#2980B9;}
+    .color.turquoise{background:#1ABC9C;}
+    .color.sun-flower{background:#F1C40F;}
+    .color.amethyst{background:#9B59B6;}
+    .color.alizarin{background:#E74C3C;}
+    .color.silver{background:#BDC3C7;}
+    .color.peter-river{background:#3498DB;}
+    .color.green-sea{background:#16A085;}
+    .color.orange{background:#F39C12;}
+    .color.wisteria{background:#8E44AD;}
+    .color.concrete{background:#95A5A6;}
+    .color.emerland{background:#2ECC71;}
+    .color.pumpkin{background:#D35400;}
+    .color.carrot{background:#E67E22;}
+    .color.asbestos{background:#7F8C8D;}
+    .color.nephritis{background:#27AE60;}
+    .color.wet-asphalt{background:#34495E;}
+    .color.pomegranate{background:#C0392B;}
+    .color.midnight-blue{background:#2C3E50;}
+    .color.clouds{background:#ECF0F1;color:#bdc3c7;}
+    " =~ m/(#......)/mg;
+
+my $DIFF_COLOR_BOUNDARY = 0.3; # ファイトフィット田町芝浦 の灰色背景に気をつける
+
+sub abstract { "prepare jsonl file for recs-fromtkdjschedule from schedule.pdf" }
+
+sub opt_spec {
+    (
+        [ "pdf=s",   "Do not download, use the specified path." ],
+        [ "page=i",  "Limit the page number to be processed."   ],
+        [ "rejsonl", "Also jsonl file exists, and process again." ],
+    );
+}
+
+sub execute {
+    my ($self, $opt, $args) = @_;
+
+    my $pdf_file   = $opt->{pdf} || $self->_fetch_pdf_file($opt);
+    my $jsonl_file = $pdf_file =~ /(.*)\.pdf$/ ? "$1.jsonl" : die;
+
+    if (!$opt->{rejsonl} and -f $jsonl_file) {
+        say "jsonl file already exists. file:$jsonl_file";
+        return 1;
+    }
+
+    my $pdfinfo_out = `pdfinfo @{[ quotemeta $pdf_file ]}`; die unless $? == 0;
+    my $last_page   = $pdfinfo_out =~ /^Pages:\s+(\d+)/m ? $1 : die;
+    my @pages       = $opt->{page} ? ($opt->{page}) : (1..$last_page);
+    my @page_size   = $pdfinfo_out =~ /^Page size:\s+(\d+) x (\d+)/m ? ($1, $2) : die;
+    my @records;
+    for my $page (@pages) {
+        push @records, $self->_process_page($pdf_file, \@page_size, $page);
+        say "page $page processed.";
+    }
+
+    my $json = JSON::MaybeXS->new->canonical->utf8;
+    io($jsonl_file)->print( map { $json->encode($_), "\n" } @records );
+    say "$jsonl_file wrote.";
+}
+
+sub _fetch_pdf_file {
+    my ($self, $opt) = @_;
+
+    my $cache_dir = File::Spec->catdir($ENV{HOME}, ".tkdjschedule/cache");
+    -d $cache_dir or make_path $cache_dir or die $!;
+
+    my $uri   = "https://tkdj.net/data/schedule.pdf";
+    my $ua    = do {
+        require LWP::UserAgent;
+        my $ua = LWP::UserAgent->new;
+        $ua->agent( do { my $path  = "$FindBin::Bin/pick_ua.pl"; trim `$path` or die } );
+        $ua->env_proxy;
+        $ua;
+    };
+    my $last  = (grep /\.pdf$/, io->catdir($cache_dir)->All_Files)[-1];
+    use URI::Fetch;
+    my $res   = URI::Fetch->fetch( $uri, UserAgent => $ua, ( $last ? ( LastModified => $last->mtime ) : () ) )
+        or die URI::Fetch->errstr;
+
+    if ( $res->status == URI::Fetch::URI_OK ) {
+        my $date = strftime( "%Y%m%dT%H%M%S%z", localtime $res->last_modified );
+        my $file = io->catfile( $cache_dir, $date, "schedule.pdf" )
+            ->binary->assert->print($res->content)
+            ->close->utime($res->last_modified,$res->last_modified);
+        say "$uri downloaded. $file wrote.";
+        $last = $file;
+    }
+    elsif ( $res->status == URI::Fetch::URI_NOT_MODIFIED ) {
+        say "$uri not modified. $last already exists.";
+    }
+    else {
+        die "Unexpected status. status:@{[ $res->status ]}";
+    }
+
+    "$last";
+}
+
+sub _process_page {
+    my ($self, $pdf_file, $page_size, $page) = @_;
+
+    my $svg_xml   = `mutool draw -o - -F svg   @{[ quotemeta $pdf_file ]} @{[ quotemeta $page ]} 2>/dev/null`;
+    die unless $? == 0;
+    my $trace_xml = `mutool draw -o - -F trace @{[ quotemeta $pdf_file ]} @{[ quotemeta $page ]} 2>/dev/null`;
+    die unless $? == 0;
+
+    require App::TKDJSchedule::XMLTwigElt;
+    require XML::Twig;
+    my $trace = XML::Twig->new(
+        pretty_print => 'indented',
+        elt_class    => 'App::TKDJSchedule::XMLTwigElt',
+    );
+    $trace->parse($trace_xml);
+
+    # my $bound = do {
+    #     my @matches = grep $_->str =~ /火曜/, $trace->find_nodes('//fill_text');
+    #     die unless @matches;
+    #     $matches[0]->text_potision;
+    # };
+
+    require JSON::MaybeXS;
+    state $json = JSON::MaybeXS->new->canonical;
+
+    my @text_nodes;
+    for my $text ($trace->find_nodes('//fill_text')) {
+        #my $pos = $text->text_potision;
+        #next unless 35 < $pos->{center} and $pos->{center} < $bound->{center};
+        push @text_nodes, $text;
+    }
+
+    # 文字が同じクラス(レッスン)に属しているか判定するための、文字無しのPDFを用意する。
+    my $png_bin = do {
+        my $twig = XML::Twig->new(
+            pretty_print => 'indented',
+            twig_handlers => {
+                #image    => sub { $_->delete },
+                symbol   => sub { $_->delete }, # 文字を消す
+                #clipPath => sub { $_->delete },
+                #use      => sub { $_->delete },
+            },
+        );
+        $twig->parse($svg_xml);
+
+        my $tmp1 = File::Temp->new( SUFFIX => '.svg' );
+        $tmp1->print($twig->sprint);
+        $tmp1->close;
+        my $tmp2 = File::Temp->new( SUFFIX => '.png' );
+        system("convert -size @{[ join 'x', @$page_size ]} $tmp1 $tmp2") == 0 or die;
+
+        io("$tmp2")->binary->all;
+    };
+
+    require Image::Magick;
+    my $img = Image::Magick->new;
+    $img->BlobToImage($png_bin);
+
+    my $n_class = 0; # ページ上に見付かるテキストの纏まりの番号。主に同じクラス(レッスン)のものを纏める。
+
+    require Algorithm::Line::Bresenham;
+    require Color::Similarity;
+    require Color::Similarity::RGB;
+    state $sim = Color::Similarity->new('Color::Similarity::RGB');
+    for my $t1 (@text_nodes) {
+        my @nears = ($t1);
+        NEAR: for my $t2 (@text_nodes) {
+            next if $t1 == $t2;
+            next if $t2->{n_class}; 
+            # 稀に中心が枠に入っていないクラスがある。centerではなくxを用いれば解消するか。
+            #my $p1_x = $t1->text_potision->{center};
+            my $p1_x = $t1->text_potision->{x};
+            my $p1_y = $t1->text_potision->{middle};
+            #my $p2_x = $t2->text_potision->{center};
+            my $p2_x = $t2->text_potision->{x};
+            my $p2_y = $t2->text_potision->{middle};
+            my $d = sqrt
+                        abs($p1_x-$p2_x)**2
+                            +
+                        abs($p1_y-$p2_y)**2;
+            # 50以上離れているものは、同じ纏まりとしない
+            if ($d > 50) {
+                next;
+            }
+            {
+                my @points = Algorithm::Line::Bresenham::line( $p1_x,$p1_y => $p2_x,$p2_y );
+                my @prev;
+                for my $p (@points) {
+                    my @cur = $img->GetPixel( x => $p->[0], y => $p->[1] );
+                    if (@prev) {
+                        my $d = $sim->distance_rgb( \@prev, \@cur );
+                        # 色差が$DIFF_COLOR_BOUNDARY以上のものは、同じ纏まりとしない
+                        if ( $d > $DIFF_COLOR_BOUNDARY ) {
+                            next NEAR;
+                        }
+                    }
+                    else {
+                        @prev = @cur;
+                    }
+                }
+            }
+            push @nears, $t2;
+        }
+        if (@nears > 1) {
+            for (@nears) {
+                $_->{n_class} = $t1->{n_class} ||= ++$n_class;
+            }
+        }
+    }
+
+    # デバッグ。svgから得られたテキストの位置と、纏まりに分類したカラーで、pngに重ねる。
+    if (0) {
+                                                                                # 円の中心xy, 円周の一点xy
+        $img->Draw( stroke => 'red', fill => 'red', primitive => 'circle', points => '20,20, 20,10' );
+        for my $text (@text_nodes) {
+            next unless trim $text->str;
+            #next unless $text->str =~ /ダイエット/;
+            my $p = $text->text_potision;
+            my $r = 2; # 円の半径
+            my $points = "@{[ $p->{center} ]},@{[ $p->{middle} ]} @{[ $p->{center} ]},@{[ $p->{middle}-$r ]}";
+            my $color = 'red';
+            if ($text->{n_class}) {
+                $color = $COLORS[ $text->{n_class}%$#COLORS ];
+            }
+            $img->Draw( stroke => $color, fill => $color, primitive => 'circle', points => $points );
+        }
+        $img->Write('debug1.png');
+        system("chrome debug1.png");
+    }
+
+    my @dow_nodes;
+    my @hour_nodes;
+    for my $node (@text_nodes) {
+        next if $node->{n_class}; # 上部の週、左右の時間は、テキストの纏まりは持たないはず
+        if ( $node->str =~ /^\d{1,2}$/ ) {
+            if ( $node->text_potision->{x} < 200 ) { # 左の時刻のみ使って、右の時刻は要らない
+                push @hour_nodes, $node;
+            }
+        }
+        if ( $node->str =~ /^.曜$/ ) {
+            push @dow_nodes, $node;
+        }
+    }
+    die unless @dow_nodes == 7;
+    die 0+@hour_nodes unless 15 < @hour_nodes and @hour_nodes < 20; # 時間はこのくらいのレンジのはず
+
+    # 背景は白とは限らない。ファイトフィット田町芝浦 -> 灰色
+    my $non_class_bg = join ",",
+        $img->GetPixel( x => $hour_nodes[0]->text_potision->{center}, y => $hour_nodes[0]->text_potision->{middle} );
+    for my $node (@text_nodes) {
+        next if $node->{n_class}; 
+        next if $node->text_potision->{y} <= $dow_nodes[0]->text_potision->{y}+10;
+        my @rgb = $img->GetPixel( x => $node->text_potision->{center}, y => $node->text_potision->{middle} );
+        unless ( join(",",@rgb) eq $non_class_bg ) {
+            # 「ストレッチ」など、単独でもクラスなものがある
+            $node->{n_class} = ++$n_class;
+        }
+    }
+
+    my %lesson;
+    for (@text_nodes) {
+        my $n_class = $_->{n_class} || next;
+        push @{$lesson{$n_class}{nodes}}, $_;
+    }
+
+    # 纏まりの上部と下部の位置を得る。主にはクラス(レッスン)の開始時間と終了時間の判定のため。
+    for my $n_class (sort { $a <=> $b } keys %lesson) {
+        my @nodes = @{$lesson{$n_class}{nodes}};
+        # 簡単のため複数ノードの中心を基準とする
+        my $x0 = sum( map $_->text_potision->{center}, @nodes )/@nodes;
+        my $y0 = sum( map $_->text_potision->{middle}, @nodes )/@nodes;
+        if ($y0 < $dow_nodes[0]->text_potision->{top}) {
+            delete $lesson{$n_class};
+            next;
+        }
+        my $top;
+        {
+            my $x = $x0;
+            my $y = $y0;
+            my @prev;
+            while ( my @cur = $img->GetPixel( x => $x, y => $y ) ) {
+                if (@prev) {
+                    my $d = $sim->distance_rgb( \@prev, \@cur );
+                    if ( $d > $DIFF_COLOR_BOUNDARY ) {
+                        last;
+                    }
+                }
+                else {
+                    @prev = @cur;
+                }
+                $y--;
+            }
+            $top = $y+1;
+        }
+        my $bottom;
+        {
+            my $x = $x0;
+            my $y = $y0;
+            my @prev;
+            while ( my @cur = $img->GetPixel( x => $x, y => $y ) ) {
+                if (@prev) {
+                    my $d = $sim->distance_rgb( \@prev, \@cur );
+                    if ( $d > $DIFF_COLOR_BOUNDARY ) {
+                        last;
+                    }
+                }
+                else {
+                    @prev = @cur;
+                }
+                $y++;
+            }
+            $bottom = $y-1;
+        }
+ 
+        $lesson{$n_class}{center}  = $x0;
+        $lesson{$n_class}{middle}  = $y0;
+        $lesson{$n_class}{top}     = $top;
+        $lesson{$n_class}{bottom}  = $bottom;
+        my @fg = do {
+            my @colors = map $_->att('color'), @nodes;
+            my %count;
+            $count{$_}++ for @colors;
+            my $color = max_by { $count{$_} } @colors;
+            my @rgb = map 0+$_, split /\s/, $color;
+               @rgb = ($rgb[0], $rgb[0], $rgb[0]) if @rgb == 1 ;
+            @rgb;
+        };
+        $lesson{$n_class}{fgcolor} = '#'.Convert::Color::RGB->new(@fg)->as_rgb8->hex;
+        $lesson{$n_class}{bgcolor} = '#'.Convert::Color::RGB->new($img->GetPixel( x => $x0, y => $y0 ))->as_rgb8->hex;
+    }
+
+    # デバッグ。纏まりの上部と下部の計算を重ねる。
+    if (0) {
+        for my $n_class (sort { $a <=> $b } keys %lesson) {
+            my $top    = $lesson{$n_class}{top};
+            my $bottom = $lesson{$n_class}{bottom};
+            my $center = $lesson{$n_class}{center};
+            my $color  = $COLORS[ abs($n_class%$#COLORS) ];
+            my $r = 2;
+            my %args   = ( stroke => $color, fill => $color, primitive=>'circle' );
+            $img->Draw( %args, points => "$center,$top    $center,@{[ $top-$r    ]}" );
+            $img->Draw( %args, points => "$center,$bottom $center,@{[ $bottom-$r ]}" );
+        }
+        $img->Write('debug2.png');
+        system("chrome debug2.png");
+    }
+
+    my $dojo;
+    for (@text_nodes) {
+        if ( $_->str =~ /^\s*★(\S+)(.*?時間割)/ ) {
+            $dojo = $1 =~ s/\d+月.*//r;
+            last;
+        }
+    }
+
+    my %ret;
+    for my $n_class (sort { $a <=> $b } keys %lesson) {
+        my @nodes = @{$lesson{$n_class}{nodes}};
+        my @texts;
+        for (nsort_by { $_->text_potision->{distance} } @nodes) {
+            push @texts, split /ボクシング\K(?=無料)/, trim $_->str;
+        }
+
+        next if grep /営業時間|食べ放題|open|close|クラス終了|定休日/, @texts;
+        next if (map /(★+)/g, @texts) > 1;
+
+        # 9
+        # ：
+        # 1
+        # 0
+        if ( join("\n", @texts) =~ /(.*)\n([:：]\n\d\n\d\n)(.*)/s ) {
+            @texts = ( (split /\n/, $1), join("", split /\n/, $2), (split /\n/, $3) );
+        }
+
+        my %h;
+        my $hh;
+        my $mm;
+        my @flags;
+        my @comments;
+        my @texts2;
+        # ハマリポイント
+        #   * 無料体験者優先 （超初心者キック）
+        #   * 13, "：", 00
+        for (@texts) {
+            # if (s/[（(](\S+?)[）)]//) {
+            #     push @flags, $1;
+            # }
+
+            s/\(|（|\)|）/ /g;
+            s/^\d{1,2}:\d{2}\s+\Kstart\b//;
+            s/^[:：]$// and next;
+
+            if (s/\s*(\S*体験\S*)\s*//) {
+                push @flags, $1;
+            }
+
+            if (s/・(\S+?円)//) {
+                push @comments, $1;
+            }
+
+            if (s/～(\d{1,2})[:：](\d{2})\b//) {
+                $h{end} = "$1:$2";
+            }
+
+            if (s/([^★\s]*)(★+)//) {
+                $h{instructor} = $1;
+                $h{stars}      = $2;
+                $h{hard}       = length $2;
+            }
+            elsif (s/^(\d{1,2})\s*[:：]\s*(\d{2})\b//) {
+                $hh = $1;
+                $mm = $2;
+            }
+            elsif (s/^(\d{1,2})[:：]$//) {
+                $hh = $1;
+            }
+            elsif (s/^[:：](\d{2})$//) {
+                $mm = $1;
+            }
+            elsif ($hh and s/^(\d{2})$//) {
+                $mm = $1;
+            }
+            elsif (!$hh and s/^(\d{1,2})$//) {
+                $hh = $1;
+            }
+
+            if (s/\s*(\S*無料\S*)\s*//) {
+                push @flags, $1;
+            }
+
+            $_ = trim $_;
+            if (length $_) {
+                push @texts2, $_;
+            }
+        }
+
+        if ($hh and $mm) {
+            $h{start} = "$hh:$mm";
+        }
+        else {
+            my $top    = $lesson{$n_class}{top};
+            # 30分と半端な場合がある
+            my ($node0, $node1) = nsort_by { abs($_->text_potision->{top}-$top) } @hour_nodes;
+            my $dest0 = abs($node0->text_potision->{top}-$top);
+            my $dest1 = abs($node1->text_potision->{top}-$top);
+            if ( $dest1/$dest0 > 2.5 ) {
+                $h{start} = $node0->str;
+            }
+            else {
+                $h{start} = $node0->str.":30";
+            }
+        }
+
+        unless ( $h{end} ) {
+            my $bottom = $lesson{$n_class}{bottom};
+            # 30分と半端な場合がある
+            my ($node0, $node1) = nsort_by { abs($_->text_potision->{top}-$bottom) } @hour_nodes;
+            my $dest0 = abs($node0->text_potision->{top}-$bottom);
+            my $dest1 = abs($node1->text_potision->{top}-$bottom);
+            if ( $dest1/$dest0 > 2.5 ) {
+                $h{end} = $node0->str;
+            }
+            else {
+                $h{end} = $node0->str.":30";
+            }
+        }
+
+        if (@texts2) {
+            if (!$h{instructor} and @texts2 >= 2) {
+                my @min_len = min_by { length $_ } @texts2;
+                my $idx     = firstidx { $_ eq $min_len[-1] } @texts2;
+                $h{instructor} = splice @texts2, $idx, 1;
+            }
+            $h{class} = join "", @texts2;
+            @texts2 = ();
+        }
+
+        $h{flags}    = \@flags if @flags;
+        $h{comments} = \@comments if @comments;
+        $h{texts}    = \@texts2 if @texts2;
+        $h{week}     = do {
+            my $center = sum( map $_->text_potision->{center}, @nodes )/@nodes;
+            my $dow    = min_by { abs($_->text_potision->{center}-$center) } @dow_nodes;
+            $dow->str;
+        };
+        $h{dow}      = _numify_dow($h{week});
+        $h{page}     = $page;
+        $h{dojo}     = $dojo;
+        $h{center}   = $lesson{$n_class}{center};
+        $h{fgcolor}  = $lesson{$n_class}{fgcolor};
+        $h{bgcolor}  = $lesson{$n_class}{bgcolor};
+
+        $h{start}    = alnum_z2h $h{start} if $h{start};
+        $h{end}      = alnum_z2h $h{end}   if $h{end};
+        $h{start_hhmm} = _normalize_hhmm($h{start}) if $h{start};
+        $h{end_hhmm}   = _normalize_hhmm($h{start}) if $h{end};
+
+        # if ($h{dow} =~ /日曜/ and grep /無料体験者限定/, @flags) {
+        # 13：00初心者キックボクシング   ファイトフィット田町芝浦   月曜   14      1      木内  
+        # if ($h{dow} =~ /月/ and $h{start} =~ /13/) {
+        #     for (nsort_by { $_->text_potision->{distance} } @nodes) {
+        #         say $_->str;
+        #     }
+        # }
+
+        $ret{sprintf '%04d', $n_class} = \%h;
+    }
+
+    # use YAML::Syck;
+    # local $YAML::Syck::ImplicitUnicode = 1;
+    # say Dump \%ret;
+
+    my @ret = sort {
+        _normalize_hhmm($a->{start}) <=> _normalize_hhmm($b->{start})
+            or
+        $a->{dow} <=> $b->{dow}
+            or
+        $a->{center} <=> $b->{center}
+    } values %ret;
+    delete $_->{center} for @ret;
+    @ret;
+}
+
+sub _normalize_hhmm {
+    my ($hh, $mm) = split /:/, $_[0];
+    sprintf "%02d%02d", $hh, $mm//00;
+}
+
+sub _numify_dow {
+    state $map = { "月曜" => 0, "火曜" => 1, "水曜" => 2, "木曜" => 3, "金曜" => 4, "土曜" => 5, "日曜" => 6 };
+    $map->{$_[0]};
+}
+
+__PACKAGE__->import->run;

@@ -1,49 +1,32 @@
 ---
-abstract: "It's new $module"
+abstract: "Parse Toikatsu Dojo's schedule.pdf and print jsonl for RecordStream."
 author:
-  - 'Tomohiro Hosaka <bokutin@bokut.in>'
-build_requires:
-  Test::Differences: '0.98'
-  Test::More: '0.98'
+  - 'Tomohiro Hosaka'
+build_requires: {}
 configure_requires:
-  Module::Build::Tiny: '0.035'
+  ExtUtils::MakeMaker: '7.1101'
 dynamic_config: 0
-generated_by: 'Minilla/v2.5.0, CPAN::Meta::Converter version 2.150010'
+generated_by: 'Dist::Zilla version 6.012, CPAN::Meta::Converter version 2.150010'
 license: perl
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html
   version: '1.4'
 name: App-RecordStream-TKDJ
-no_index:
-  directory:
-    - t
-    - xt
-    - inc
-    - share
-    - eg
-    - examples
-    - author
-    - builder
-provides:
-  App::RecordStream::Operation::fromtkdjschedule:
-    file: lib/App/RecordStream/Operation/fromtkdjschedule.pm
-  App::RecordStream::Operation::fromtkdjschedule::Elt:
-    file: lib/App/RecordStream/Operation/fromtkdjschedule.pm
-  App::RecordStream::TKDJ:
-    file: lib/App/RecordStream/TKDJ.pm
-    version: '0.01'
 requires:
   Algorithm::Combinatorics: '0'
-  Cache::File: '0'
+  Algorithm::Line::Bresenham: '0'
+  App::Cmd: '0'
+  Color::Similarity: '0'
+  Convert::Color: '0'
   IO::All: '0'
-  IPC::Run: '0'
-  List::Util: '0'
+  Image::Magick: '0'
+  JSON::MaybeXS: '0'
+  Lingua::JA::Regular::Unicode: '0'
   List::UtilsBy: '0'
-  Math::Round: '0'
-  Set::IntSpan: '0'
+  Modern::Perl: '0'
   Text::Trim: '0'
-  URI::Fetch: '0'
   XML::Twig: '0'
-  perl: '5.010001'
-version: '0.01'
-x_serialization_backend: 'CPAN::Meta::YAML version 0.018'
+  rlib: '0'
+version: '0.02'
+x_generated_by_perl: v5.26.2
+x_serialization_backend: 'YAML::Tiny version 1.73'
